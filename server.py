@@ -14,28 +14,16 @@ from flask import Flask, jsonify, render_template_string
 app = Flask(__name__)
 
 IST = ZoneInfo("Asia/Kolkata")
-
 TOKEN = os.getenv("UPSTOX_ACCESS_TOKEN", "").strip()
 
-INSTRUMENT_URL = (
-    "https://assets.upstox.com/market-quote/"
-    "instruments/exchange/NSE.json.gz"
-)
+INSTRUMENT_URL = "https://assets.upstox.com/market-quote/instruments/exchange/NSE.json.gz"
 
 MIN_PRICE = 20.0
-
-# Upstox Full Feed current combined limit = 1500.
-# One place is reserved for NIFTY 50.
 MAX_SUBSCRIPTIONS = 1500
-MAX_EQUITY_SUBSCRIPTIONS = MAX_SUBSCRIPTIONS - 1
-
+MAX_EQUITY_SUBSCRIPTIONS = 1499
 NIFTY_KEY = "NSE_INDEX|Nifty 50"
 
-
 INSTRUMENTS = []
-BY_KEY = {}
-BY_SYMBOL = {}
-
 FEEDS = {}
 
 STREAMER = None
@@ -43,239 +31,108 @@ STREAM_THREAD = None
 STREAM_LOCK = threading.Lock()
 
 LAST_TICK = 0.0
-
 STREAM_STATUS = "Not started"
 STREAM_ERROR = ""
-
 STARTED = False
 
 
-# ---------------------------------------------------------
-# BASIC HELPERS
-# ---------------------------------------------------------
-
-def num(value, default=0.0):
-
+def num(v, d=0.0):
     try:
-        return float(value)
+        return float(v)
+    except:
+        return d
 
-    except Exception:
-        return default
 
-
-def clamp(value, low=0.0, high=100.0):
-
-    return max(
-        low,
-        min(high, num(value))
-    )
+def clamp(v, lo=0, hi=100):
+    return max(lo, min(hi, num(v)))
 
 
 def percentile(values):
-
     if not values:
         return []
-
     if len(values) == 1:
         return [50.0]
 
-    order = sorted(
-        range(len(values)),
-        key=lambda i: values[i]
-    )
+    order = sorted(range(len(values)), key=lambda i: values[i])
+    out = [50.0] * len(values)
 
-    result = [50.0] * len(values)
+    for r, i in enumerate(order):
+        out[i] = r * 100.0 / (len(values) - 1)
 
-    for rank, index in enumerate(order):
+    return out
 
-        result[index] = (
-            rank * 100.0
-            / (len(values) - 1)
-        )
-
-    return result
-
-
-# ---------------------------------------------------------
-# LOAD NSE EQUITY INSTRUMENTS
-# ---------------------------------------------------------
 
 def load_instruments():
-
     global INSTRUMENTS
-    global BY_KEY
-    global BY_SYMBOL
 
-    response = requests.get(
+    r = requests.get(
         INSTRUMENT_URL,
-        headers={
-            "User-Agent":
-                "Mozilla/5.0 PreMarketStrengthRankScanner"
-        },
+        headers={"User-Agent": "Mozilla/5.0 PreMarketStrengthRankScanner"},
         timeout=30
     )
-
-    response.raise_for_status()
-
-    raw = gzip.decompress(
-        response.content
-    )
+    r.raise_for_status()
 
     data = json.loads(
-        raw.decode("utf-8")
+        gzip.decompress(r.content).decode("utf-8")
     )
 
     result = []
 
-    by_key = {}
-    by_symbol = {}
-
-    for item in data:
-
-        if item.get("segment") != "NSE_EQ":
+    for x in data:
+        if x.get("segment") != "NSE_EQ":
+            continue
+        if x.get("instrument_type") != "EQ":
             continue
 
-        if item.get("instrument_type") != "EQ":
-            continue
-
-        symbol = str(
-            item.get(
-                "trading_symbol",
-                ""
-            )
-        ).strip()
-
-        key = str(
-            item.get(
-                "instrument_key",
-                ""
-            )
-        ).strip()
+        symbol = str(x.get("trading_symbol", "")).strip()
+        key = str(x.get("instrument_key", "")).strip()
 
         if not symbol or not key:
             continue
 
-        row = {
+        result.append({
+            "symbol": symbol,
+            "key": key,
+            "name": x.get("short_name") or x.get("name") or symbol
+        })
 
-            "symbol":
-                symbol,
-
-            "key":
-                key,
-
-            "name":
-                item.get("short_name")
-                or item.get("name")
-                or symbol
-        }
-
-        result.append(row)
-
-        by_key[key] = row
-
-        by_symbol[symbol] = row
-
-    # Stable ordering.
-    result.sort(
-        key=lambda x:
-            x["symbol"]
-    )
-
+    result.sort(key=lambda x: x["symbol"])
     INSTRUMENTS = result
 
-    BY_KEY = by_key
-
-    BY_SYMBOL = by_symbol
-
-
-# ---------------------------------------------------------
-# EXTRACT UPSTOX FEED
-# ---------------------------------------------------------
 
 def extract_feed(feed):
+    full = feed.get("fullFeed") or feed.get("full_feed") or {}
+    market = full.get("marketFF") or full.get("market_ff") or {}
+    ltpc = full.get("ltpc") or {}
 
-    full = (
-        feed.get("fullFeed")
-        or feed.get("full_feed")
-        or {}
-    )
-
-    market = (
-        full.get("marketFF")
-        or full.get("market_ff")
-        or {}
-    )
-
-    if not isinstance(
-        market,
-        dict
-    ):
+    if not isinstance(market, dict):
         market = {}
-
-    ltpc = (
-        full.get("ltpc")
-        or feed.get("ltpc")
-        or {}
-    )
-
-    if not isinstance(
-        ltpc,
-        dict
-    ):
+    if not isinstance(ltpc, dict):
         ltpc = {}
 
-    return (
-        full,
-        market,
-        ltpc
-    )
+    return full, market, ltpc
 
-
-# ---------------------------------------------------------
-# WEBSOCKET CALLBACKS
-# ---------------------------------------------------------
 
 def on_open():
-
-    global STREAM_STATUS
-    global STREAM_ERROR
-
+    global STREAM_STATUS, STREAM_ERROR
     STREAM_STATUS = "Connected"
-
     STREAM_ERROR = ""
 
 
 def on_message(message):
+    global LAST_TICK, STREAM_STATUS
 
-    global LAST_TICK
-    global STREAM_STATUS
-
-    if not isinstance(
-        message,
-        dict
-    ):
+    if not isinstance(message, dict):
         return
 
-    feeds = (
-        message.get("feeds")
-        or {}
-    )
+    feeds = message.get("feeds") or {}
 
-    if not isinstance(
-        feeds,
-        dict
-    ):
+    if not isinstance(feeds, dict):
         return
 
     with STREAM_LOCK:
-
         for key, feed in feeds.items():
-
-            if isinstance(
-                feed,
-                dict
-            ):
-
+            if isinstance(feed, dict):
                 FEEDS[key] = feed
 
         LAST_TICK = time.time()
@@ -284,643 +141,253 @@ def on_message(message):
 
 
 def on_error(error):
-
-    global STREAM_STATUS
-    global STREAM_ERROR
-
+    global STREAM_STATUS, STREAM_ERROR
     STREAM_STATUS = "Error"
-
-    STREAM_ERROR = str(
-        error
-    )[:250]
+    STREAM_ERROR = str(error)[:250]
 
 
 def on_close(*args):
-
     global STREAM_STATUS
-
     STREAM_STATUS = "Disconnected"
 
 
-# ---------------------------------------------------------
-# UPSTOX WEBSOCKET THREAD
-# ---------------------------------------------------------
-
 def stream_worker():
-
-    global STREAMER
-    global STREAM_STATUS
-    global STREAM_ERROR
+    global STREAMER, STREAM_STATUS, STREAM_ERROR
 
     try:
-
         if not TOKEN:
-
             raise RuntimeError(
-                "UPSTOX_ACCESS_TOKEN Render "
-                "Environment Variable is missing."
+                "UPSTOX_ACCESS_TOKEN Render Environment Variable is missing."
             )
 
         if not INSTRUMENTS:
-
             load_instruments()
 
         equity_keys = [
-
-            item["key"]
-
-            for item in
-            INSTRUMENTS[
-                :MAX_EQUITY_SUBSCRIPTIONS
-            ]
-
+            x["key"]
+            for x in INSTRUMENTS[:MAX_EQUITY_SUBSCRIPTIONS]
         ]
 
-        keys = (
-            equity_keys
-            + [NIFTY_KEY]
-        )
+        keys = equity_keys + [NIFTY_KEY]
 
-        configuration = (
-            upstox_client.Configuration()
-        )
-
+        configuration = upstox_client.Configuration()
         configuration.access_token = TOKEN
 
-        STREAMER = (
-            upstox_client.MarketDataStreamerV3(
-                upstox_client.ApiClient(
-                    configuration
-                ),
-                keys,
-                "full"
-            )
+        STREAMER = upstox_client.MarketDataStreamerV3(
+            upstox_client.ApiClient(configuration),
+            keys,
+            "full"
         )
 
-        STREAMER.on(
-            "open",
-            on_open
-        )
+        STREAMER.on("open", on_open)
+        STREAMER.on("message", on_message)
+        STREAMER.on("error", on_error)
+        STREAMER.on("close", on_close)
 
-        STREAMER.on(
-            "message",
-            on_message
-        )
-
-        STREAMER.on(
-            "error",
-            on_error
-        )
-
-        STREAMER.on(
-            "close",
-            on_close
-        )
-
-        STREAMER.auto_reconnect(
-            True,
-            5,
-            20
-        )
+        STREAMER.auto_reconnect(True, 5, 20)
 
         STREAM_STATUS = (
-            "Connecting ("
-            + str(len(equity_keys))
-            + " stocks + NIFTY)"
+            f"Connecting ({len(equity_keys)} stocks + NIFTY)"
         )
 
         STREAMER.connect()
 
-    except Exception as error:
-
+    except Exception as e:
         STREAM_STATUS = "Error"
+        STREAM_ERROR = str(e)[:250]
 
-        STREAM_ERROR = str(
-            error
-        )[:250]
-
-
-# ---------------------------------------------------------
-# START STREAM ONLY ON FIRST USE
-# ---------------------------------------------------------
 
 def ensure_stream():
-
-    global STARTED
-    global STREAM_THREAD
+    global STARTED, STREAM_THREAD
 
     if STARTED:
         return
 
     with STREAM_LOCK:
-
         if STARTED:
             return
 
         STARTED = True
 
-        STREAM_THREAD = (
-            threading.Thread(
-                target=stream_worker,
-                daemon=True,
-                name="upstox-market-feed"
-            )
+        STREAM_THREAD = threading.Thread(
+            target=stream_worker,
+            daemon=True,
+            name="upstox-market-feed"
         )
-
         STREAM_THREAD.start()
 
 
-# ---------------------------------------------------------
-# GET STORED FEED
-# ---------------------------------------------------------
+def get_feed(key, snapshot):
+    feed = snapshot.get(key)
 
-def get_feed_for_key(key):
+    if feed:
+        return feed
 
-    with STREAM_LOCK:
+    return snapshot.get(key.replace("|", ":"))
 
-        feed = FEEDS.get(
-            key
-        )
-
-        if feed:
-            return feed
-
-        return FEEDS.get(
-            key.replace(
-                "|",
-                ":"
-            )
-        )
-
-
-# ---------------------------------------------------------
-# LTP / PREVIOUS CLOSE / IEP
-# ---------------------------------------------------------
 
 def get_ltp_close(feed):
-
-    _, _, ltpc = (
-        extract_feed(feed)
-    )
+    _, _, ltpc = extract_feed(feed)
 
     return (
-
-        num(
-            ltpc.get(
-                "ltp"
-            )
-        ),
-
-        num(
-            ltpc.get(
-                "cp"
-            )
-        ),
-
-        num(
-            ltpc.get(
-                "iep"
-            )
-        )
+        num(ltpc.get("ltp")),
+        num(ltpc.get("cp")),
+        num(ltpc.get("iep"))
     )
 
-
-# ---------------------------------------------------------
-# LIVE PRE-OPEN DATA
-# ---------------------------------------------------------
 
 def get_market_values(feed):
+    _, market, ltpc = extract_feed(feed)
 
-    _, market, ltpc = (
-        extract_feed(feed)
-    )
-
-    # IEP
-    iep = num(
-        market.get(
-            "iep"
-        )
-    )
+    iep = num(market.get("iep"))
 
     if iep <= 0:
+        iep = num(ltpc.get("iep"))
 
-        iep = num(
-            ltpc.get(
-                "iep"
-            )
-        )
+    buy = num(market.get("tbq"))
+    sell = num(market.get("tsq"))
 
-    # Total Buy Quantity
-    buy = num(
-        market.get(
-            "tbq"
-        )
-    )
-
-    # Total Sell Quantity
-    sell = num(
-        market.get(
-            "tsq"
-        )
-    )
-
-    # Compatibility fallback
     if buy <= 0 or sell <= 0:
-
         efeed = (
-
-            market.get(
-                "eFeedDetails"
-            )
-
-            or
-
-            market.get(
-                "e_feed_details"
-            )
-
+            market.get("eFeedDetails")
+            or market.get("e_feed_details")
             or {}
         )
 
         if buy <= 0:
-
-            buy = num(
-                efeed.get(
-                    "tbq"
-                )
-            )
+            buy = num(efeed.get("tbq"))
 
         if sell <= 0:
+            sell = num(efeed.get("tsq"))
 
-            sell = num(
-                efeed.get(
-                    "tsq"
-                )
-            )
+    ieq = num(market.get("ieq"))
 
-    # Actual indicative imbalance
     actual_imbalance = num(
-        market.get(
-            "iiqTotal"
-        )
+        market.get("iiqTotal")
     )
 
-    total = (
-        buy
-        + sell
-    )
+    total = buy + sell
 
-    # Buy/Sell imbalance
     if total > 0:
-
-        buy_sell_imbalance = (
-            (buy - sell)
-            / total
-        )
-
+        imbalance = (buy - sell) / total
     else:
+        imbalance = 0.0
 
-        buy_sell_imbalance = 0.0
-
-    # Fallback if actual imbalance field
-    # is not available.
-    if (
-        actual_imbalance == 0
-        and total > 0
-    ):
-
-        actual_imbalance = (
-            buy - sell
-        )
-
-    ieq = num(
-        market.get(
-            "ieq"
-        )
-    )
+    if actual_imbalance == 0 and total > 0:
+        actual_imbalance = buy - sell
 
     return (
-
         iep,
-
         buy,
-
         sell,
-
-        buy_sell_imbalance,
-
+        imbalance,
         actual_imbalance,
-
         ieq
     )
 
 
-# ---------------------------------------------------------
-# PREVIOUS DAY FROM UPSTOX DAILY CANDLE
-# ---------------------------------------------------------
-
 def get_previous_day(feed):
+    full, _, ltpc = extract_feed(feed)
 
-    full, market, ltpc = (
-        extract_feed(feed)
-    )
-
-    ohlc_block = (
-
-        full.get(
-            "marketOHLC"
-        )
-
-        or
-
-        full.get(
-            "market_ohlc"
-        )
-
+    block = (
+        full.get("marketOHLC")
+        or full.get("market_ohlc")
         or {}
     )
 
-    candles = (
-        ohlc_block.get(
-            "ohlc"
-        )
-        or []
-    )
+    candles = block.get("ohlc") or []
 
-    if not isinstance(
-        candles,
-        list
-    ):
+    if not isinstance(candles, list):
         candles = []
 
     daily = None
 
-    for candle in candles:
-
-        if str(
-            candle.get(
-                "interval",
-                ""
-            )
-        ).lower() == "1d":
-
-            daily = candle
-
+    for c in candles:
+        if str(c.get("interval", "")).lower() == "1d":
+            daily = c
             break
 
     if not daily:
-
         return {
-
             "open": 0,
-
             "high": 0,
-
             "low": 0,
-
-            "close":
-                num(
-                    ltpc.get(
-                        "cp"
-                    )
-                ),
-
+            "close": num(ltpc.get("cp")),
             "volume": 0
         }
 
-    close = num(
-        daily.get(
-            "close"
-        )
-    )
-
-    volume = num(
-        daily.get(
-            "vol"
-        )
-    )
+    close = num(daily.get("close"))
 
     if close <= 0:
-
-        close = num(
-            ltpc.get(
-                "cp"
-            )
-        )
+        close = num(ltpc.get("cp"))
 
     return {
-
-        "open":
-            num(
-                daily.get(
-                    "open"
-                )
-            ),
-
-        "high":
-            num(
-                daily.get(
-                    "high"
-                )
-            ),
-
-        "low":
-            num(
-                daily.get(
-                    "low"
-                )
-            ),
-
-        "close":
-            close,
-
-        "volume":
-            volume
+        "open": num(daily.get("open")),
+        "high": num(daily.get("high")),
+        "low": num(daily.get("low")),
+        "close": close,
+        "volume": num(daily.get("vol"))
     }
 
 
-# ---------------------------------------------------------
-# MAIN SCANNER
-# ---------------------------------------------------------
-
 def scan():
-
     ensure_stream()
 
-    now = datetime.now(
-        IST
-    )
+    now = datetime.now(IST)
+    current = now.time()
 
-    current_time = now.time()
-
-    # Pre-open window.
-    if (
-        current_time
-        < dt_time(
-            8,
-            55
-        )
-
-        or
-
-        current_time
-        > dt_time(
-            9,
-            16
-        )
-    ):
-
+    if current < dt_time(9, 0):
         return {
-
-            "time":
-                now.strftime(
-                    "%H:%M:%S"
-                ),
-
+            "time": now.strftime("%H:%M:%S"),
             "count": 0,
-
             "rows": [],
-
-            "message":
-                "Pre-open session is not active.",
-
+            "message": "Pre-open 9:00 AM पर शुरू होगा.",
             "nifty_gap": 0,
+            "stream": STREAM_STATUS
+        }
 
-            "stream":
-                STREAM_STATUS
+    if current >= dt_time(9, 15):
+        return {
+            "time": now.strftime("%H:%M:%S"),
+            "count": 0,
+            "rows": [],
+            "message": "Pre-open session समाप्त हो चुका है.",
+            "nifty_gap": 0,
+            "stream": STREAM_STATUS
         }
 
     with STREAM_LOCK:
+        snapshot = dict(FEEDS)
 
-        snapshot = dict(
-            FEEDS
-        )
-
-    # -----------------------------------------------------
-    # NIFTY
-    # -----------------------------------------------------
-
-    nifty_feed = (
-        snapshot.get(
-            NIFTY_KEY
-        )
-    )
-
-    if not nifty_feed:
-
-        nifty_feed = snapshot.get(
-            NIFTY_KEY.replace(
-                "|",
-                ":"
-            )
-        )
-
-    if not nifty_feed:
-
+    if not snapshot:
         return {
-
-            "time":
-                now.strftime(
-                    "%H:%M:%S"
-                ),
-
+            "time": now.strftime("%H:%M:%S"),
             "count": 0,
-
             "rows": [],
-
-            "message":
-                "NIFTY pre-open data is "
-                "not received yet.",
-
+            "message": "Upstox live pre-open feed का इंतजार…",
             "nifty_gap": 0,
-
-            "stream":
-                STREAM_STATUS
+            "stream": STREAM_STATUS
         }
 
-    (
-        nifty_iep,
-        _,
-        _,
-        _,
-        _,
-        _
-    ) = get_market_values(
-        nifty_feed
-    )
+    nifty_feed = get_feed(NIFTY_KEY, snapshot)
 
-    (
-        _,
-        nifty_cp,
-        nifty_ltpc_iep
-    ) = get_ltp_close(
-        nifty_feed
-    )
+    nifty_gap = 0.0
 
-    if nifty_iep <= 0:
+    if nifty_feed:
+        n_iep, _, _, _, _, _ = get_market_values(nifty_feed)
+        _, n_cp, n_ltpc_iep = get_ltp_close(nifty_feed)
 
-        nifty_iep = (
-            nifty_ltpc_iep
-        )
+        if n_iep <= 0:
+            n_iep = n_ltpc_iep
 
-    if (
-        nifty_iep <= 0
-        or nifty_cp <= 0
-    ):
-
-        return {
-
-            "time":
-                now.strftime(
-                    "%H:%M:%S"
-                ),
-
-            "count": 0,
-
-            "rows": [],
-
-            "message":
-                "NIFTY IEP अभी उपलब्ध नहीं है.",
-
-            "nifty_gap": 0,
-
-            "stream":
-                STREAM_STATUS
-        }
-
-    nifty_gap = (
-
-        (
-            nifty_iep
-            - nifty_cp
-        )
-        / nifty_cp
-
-    ) * 100
-
-
-    # -----------------------------------------------------
-    # STOCK CANDIDATES
-    # -----------------------------------------------------
+        if n_iep > 0 and n_cp > 0:
+            nifty_gap = (n_iep - n_cp) / n_cp * 100
 
     candidates = []
 
-    for item in INSTRUMENTS[
-        :MAX_EQUITY_SUBSCRIPTIONS
-    ]:
+    for item in INSTRUMENTS[:MAX_EQUITY_SUBSCRIPTIONS]:
 
-        feed = snapshot.get(
-            item["key"]
-        )
-
-        if not feed:
-
-            feed = snapshot.get(
-                item["key"].replace(
-                    "|",
-                    ":"
-                )
-            )
+        feed = get_feed(item["key"], snapshot)
 
         if not feed:
             continue
@@ -929,516 +396,230 @@ def scan():
             iep,
             buy,
             sell,
-            bs_imbalance,
+            imbalance,
             actual_imbalance,
             ieq
-        ) = get_market_values(
-            feed
-        )
+        ) = get_market_values(feed)
 
-        if iep <= 0:
-            continue
-
-        if iep < MIN_PRICE:
-            continue
-
-        (
-            _,
-            previous_close,
-            _
-        ) = get_ltp_close(
-            feed
-        )
+        _, previous_close, ltpc_iep = get_ltp_close(feed)
 
         if previous_close <= 0:
             continue
 
-        gap = (
+        if iep <= 0:
+            iep = ltpc_iep
 
-            (
-                iep
-                - previous_close
-            )
-            / previous_close
+        # If price is not available yet, use previous close
+        # only temporarily so order data can still appear.
+        display_price = iep if iep > 0 else previous_close
 
-        ) * 100
-
-        # Positive / upside shares only.
-        if gap <= 0:
+        if display_price < MIN_PRICE:
             continue
 
-        total_orders = (
-            buy
-            + sell
-        )
+        total_orders = buy + sell
 
+        # No order data yet = skip.
         if total_orders <= 0:
             continue
 
-        # -------------------------------------------------
-        # PREVIOUS DAY STRENGTH
-        # -------------------------------------------------
+        gap = 0.0
 
-        previous = (
-            get_previous_day(
-                feed
-            )
-        )
+        if iep > 0:
+            gap = (iep - previous_close) / previous_close * 100
 
-        previous_day_close = (
-            previous["close"]
-            or previous_close
-        )
+        # We want positive / upside candidates.
+        if iep > 0 and gap <= 0:
+            continue
+
+        previous = get_previous_day(feed)
+
+        prev_close = previous["close"] or previous_close
 
         previous_return = 0.0
 
-        if (
-            previous_day_close > 0
-            and previous["open"] > 0
-        ):
-
+        if previous["open"] > 0 and prev_close > 0:
             previous_return = (
-
-                (
-                    previous_day_close
-                    - previous["open"]
-                )
+                (prev_close - previous["open"])
                 / previous["open"]
-
             ) * 100
 
-        day_range = (
-
-            previous["high"]
-            - previous["low"]
-        )
+        day_range = previous["high"] - previous["low"]
 
         if day_range > 0:
-
             close_position = (
-
-                (
-                    previous_day_close
-                    - previous["low"]
-                )
+                (prev_close - previous["low"])
                 / day_range
             )
-
         else:
-
             close_position = 0.5
 
         return_score = clamp(
-
-            (
-                previous_return
-                + 3
-            )
-            / 6
-            * 100
+            (previous_return + 3) / 6 * 100
         )
 
         previous_strength = (
-
-            return_score
-            * 0.40
-
+            return_score * 0.40
             +
-
-            clamp(
-                close_position
-                * 100
-            )
-            * 0.60
+            clamp(close_position * 100) * 0.60
         )
 
-        high_position = clamp(
-            close_position
-            * 100
-        )
-
-        # -------------------------------------------------
-        # RELATIVE STRENGTH VS NIFTY
-        # -------------------------------------------------
-
-        outperformance = (
-            gap
-            - nifty_gap
-        )
+        outperformance = gap - nifty_gap
 
         relative_score = clamp(
-
-            (
-                outperformance
-                + 1
-            )
-            / 3
-            * 100
+            (outperformance + 1) / 3 * 100
         )
 
-        # Previous-day turnover
-        previous_turnover = (
-
-            previous_day_close
-            * previous["volume"]
-        )
+        turnover = prev_close * previous["volume"]
 
         candidates.append({
-
-            "symbol":
-                item["symbol"],
-
-            "name":
-                item["name"],
-
-            "iep":
-                iep,
-
-            "gap":
-                gap,
-
-            "buy":
-                buy,
-
-            "sell":
-                sell,
-
-            "imbalance":
-                bs_imbalance,
-
-            "actual_imbalance":
-                actual_imbalance,
-
-            "ieq":
-                ieq,
-
-            "previous":
-                previous_strength,
-
-            "high_position":
-                high_position,
-
-            "relative":
-                relative_score,
-
-            "turnover":
-                previous_turnover
+            "symbol": item["symbol"],
+            "name": item["name"],
+            "iep": iep,
+            "price": display_price,
+            "gap": gap,
+            "buy": buy,
+            "sell": sell,
+            "imbalance": imbalance,
+            "ieq": ieq,
+            "previous": previous_strength,
+            "relative": relative_score,
+            "turnover": turnover
         })
 
-
-    # -----------------------------------------------------
-    # NO CANDIDATES
-    # -----------------------------------------------------
-
     if not candidates:
-
         return {
-
-            "time":
-                now.strftime(
-                    "%H:%M:%S"
-                ),
-
+            "time": now.strftime("%H:%M:%S"),
             "count": 0,
-
             "rows": [],
-
-            "message":
-                "Live pre-open data received, "
-                "but no positive candidate has "
-                "complete order data yet.",
-
-            "nifty_gap":
-                round(
-                    nifty_gap,
-                    2
-                ),
-
-            "stream":
-                STREAM_STATUS
+            "message": (
+                "Live feed connected है, "
+                "लेकिन अभी positive Buy/Sell candidate नहीं मिला."
+            ),
+            "nifty_gap": round(nifty_gap, 2),
+            "stream": STREAM_STATUS
         }
 
-
-    # -----------------------------------------------------
-    # LIVE ORDER RANKINGS
-    # -----------------------------------------------------
-
     buy_scores = percentile([
-
-        math.log1p(
-            x["buy"]
-        )
-
+        math.log1p(x["buy"])
         for x in candidates
     ])
-
 
     imbalance_scores = percentile([
-
         x["imbalance"]
-
         for x in candidates
     ])
 
+    ieq_scores = percentile([
+        math.log1p(x["ieq"])
+        for x in candidates
+    ])
 
     liquidity_scores = percentile([
-
-        math.log10(
-            max(
-                x["turnover"],
-                1
-            )
-        )
-
+        math.log10(max(x["turnover"], 1))
         for x in candidates
     ])
-
-
-    # -----------------------------------------------------
-    # FINAL SCORE
-    # -----------------------------------------------------
 
     rows = []
 
-    for i, c in enumerate(
-        candidates
-    ):
+    for i, c in enumerate(candidates):
 
-        # 30% IEP Gap
         gap_score = clamp(
-
-            c["gap"]
-            / 3
-            * 100
+            c["gap"] / 3 * 100
         )
 
-        # 25% Buy/Sell imbalance
-        imbalance_score = (
-            imbalance_scores[i]
-        )
-
-        # 20% Absolute Buy Quantity
-        buy_score = (
-            buy_scores[i]
-        )
-
-        # 10% NIFTY relative strength
-        relative_score = (
-            c["relative"]
-        )
-
-        # 10% Previous-day strength
-        previous_score = (
-            c["previous"]
-        )
-
-        # 5% Liquidity
-        liquidity_score = (
-            liquidity_scores[i]
-        )
+        buy_score = buy_scores[i]
+        imbalance_score = imbalance_scores[i]
+        ieq_score = ieq_scores[i]
+        relative_score = c["relative"]
+        previous_score = c["previous"]
+        liquidity_score = liquidity_scores[i]
 
         final_score = (
-
-            gap_score
-            * 0.30
-
+            gap_score * 0.25
             +
-
-            imbalance_score
-            * 0.25
-
+            imbalance_score * 0.20
             +
-
-            buy_score
-            * 0.20
-
+            buy_score * 0.15
             +
-
-            relative_score
-            * 0.10
-
+            ieq_score * 0.15
             +
-
-            previous_score
-            * 0.10
-
+            relative_score * 0.10
             +
-
-            liquidity_score
-            * 0.05
+            previous_score * 0.10
+            +
+            liquidity_score * 0.05
         )
 
         rows.append({
-
-            "symbol":
-                c["symbol"],
-
-            "name":
-                c["name"],
-
-            "score":
-                round(
-                    clamp(
-                        final_score
-                    ),
-                    1
-                ),
-
-            "iep":
-                round(
-                    c["iep"],
-                    2
-                ),
-
-            "gap":
-                round(
-                    c["gap"],
-                    2
-                ),
-
-            "buy":
-                int(
-                    c["buy"]
-                ),
-
-            "sell":
-                int(
-                    c["sell"]
-                ),
-
-            "imbalance":
-                round(
-                    c["imbalance"]
-                    * 100,
-                    1
-                ),
-
-            "previous":
-                round(
-                    previous_score,
-                    1
-                ),
-
-            "relative":
-                round(
-                    relative_score,
-                    1
-                ),
-
-            "turnover":
-                round(
-                    c["turnover"]
-                    / 10000000,
-                    2
-                )
+            "symbol": c["symbol"],
+            "score": round(clamp(final_score), 1),
+            "iep": round(c["price"], 2),
+            "gap": round(c["gap"], 2),
+            "buy": int(c["buy"]),
+            "sell": int(c["sell"]),
+            "imbalance": round(c["imbalance"] * 100, 1),
+            "ieq": int(c["ieq"]),
+            "previous": round(previous_score, 1),
+            "relative": round(relative_score, 1),
+            "turnover": round(
+                c["turnover"] / 10000000,
+                2
+            )
         })
 
-
-    # -----------------------------------------------------
-    # SORT
-    # -----------------------------------------------------
-
     rows.sort(
-
         key=lambda x: (
-
             -x["score"],
-
             -x["gap"],
-
             -x["imbalance"],
-
             x["symbol"]
         )
     )
 
-
-    for rank, row in enumerate(
-        rows,
-        1
-    ):
-
+    for rank, row in enumerate(rows, 1):
         row["rank"] = rank
 
-
     return {
-
-        "time":
-            now.strftime(
-                "%H:%M:%S"
-            ),
-
-        "count":
-            len(rows),
-
-        "rows":
-            rows[:100],
-
-        "message":
-            "Live Pre-Market Ranking",
-
-        "nifty_gap":
-            round(
-                nifty_gap,
-                2
-            ),
-
-        "stream":
-            STREAM_STATUS,
-
-        "subscribed":
-            min(
-                len(INSTRUMENTS),
-                MAX_EQUITY_SUBSCRIPTIONS
-            )
+        "time": now.strftime("%H:%M:%S"),
+        "count": len(rows),
+        "rows": rows[:100],
+        "message": "Live Pre-Market Ranking",
+        "nifty_gap": round(nifty_gap, 2),
+        "stream": STREAM_STATUS,
+        "subscribed": min(
+            len(INSTRUMENTS),
+            MAX_EQUITY_SUBSCRIPTIONS
+        )
     }
 
 
-# ---------------------------------------------------------
-# HTML
-# ---------------------------------------------------------
-
 HTML = """
 <!DOCTYPE html>
-
 <html lang="hi">
-
 <head>
-
 <meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
 
-<meta name="viewport"
-content="width=device-width,initial-scale=1">
-
-<title>
-Pre-Market Strength Rank
-</title>
+<title>Pre-Market Strength Rank</title>
 
 <style>
-
-*{
-box-sizing:border-box;
-}
-
+*{box-sizing:border-box}
 body{
 margin:0;
 padding:7px;
 background:#10151b;
 color:#e9eef5;
-font-family:Arial,sans-serif;
+font-family:Arial,sans-serif
 }
-
 h2{
 margin:7px 0 2px;
-font-size:20px;
+font-size:20px
 }
-
 .sub{
 font-size:12px;
 color:#9ca7b4;
-margin-bottom:8px;
+margin-bottom:8px
 }
-
 button{
 width:100%;
 padding:11px;
@@ -1447,90 +628,66 @@ border-radius:8px;
 background:#2677ee;
 color:white;
 font-size:15px;
-font-weight:bold;
+font-weight:bold
 }
-
 .status{
 margin:8px 0;
 padding:8px;
 background:#19222c;
 border-radius:8px;
 font-size:12px;
-line-height:1.45;
+line-height:1.45
 }
-
-.tablebox{
-overflow:auto;
-}
-
+.tablebox{overflow:auto}
 table{
 border-collapse:collapse;
 width:100%;
-min-width:760px;
-background:#131a22;
+min-width:850px;
+background:#131a22
 }
-
 th,td{
 padding:7px;
 border-bottom:1px solid #29333d;
 font-size:12px;
 white-space:nowrap;
-text-align:right;
+text-align:right
 }
-
 th{
 background:#1c2732;
 position:sticky;
-top:0;
+top:0
 }
-
 th:first-child,
 td:first-child,
 th:nth-child(2),
 td:nth-child(2){
-text-align:left;
+text-align:left
 }
-
 .score{
 font-weight:bold;
-font-size:14px;
+font-size:14px
 }
-
 .note{
 margin-top:8px;
 font-size:11px;
 color:#8e9aa8;
-line-height:1.5;
+line-height:1.5
 }
-
 </style>
-
 </head>
 
 <body>
 
-<h2>
-🌅 Pre-Market Strength Rank
-</h2>
+<h2>🌅 Pre-Market Strength Rank</h2>
 
 <div class="sub">
-
-NSE EQ • Live Pre-Open Order Flow •
-0–100 • Strongest First
-
+NSE EQ • Live Pre-Open Order Flow • 0–100 • Strongest First
 </div>
 
-<button onclick="scan()">
+<button onclick="scan()">SCAN NOW</button>
 
-SCAN NOW
-
-</button>
-
-<div id="status"
-class="status">
-
-Pre-open live feed का इंतजार…
-
+<div id="status" class="status">
+9:00 AM pre-open feed का इंतजार…
 </div>
 
 <div class="tablebox">
@@ -1538,37 +695,23 @@ Pre-open live feed का इंतजार…
 <table>
 
 <thead>
-
 <tr>
-
 <th>Rank</th>
-
 <th>Symbol</th>
-
 <th>Score</th>
-
 <th>IEP</th>
-
 <th>Gap %</th>
-
 <th>Buy Qty</th>
-
 <th>Sell Qty</th>
-
 <th>Imbalance %</th>
-
+<th>IEQ</th>
 <th>Prev Strength</th>
-
 <th>Relative</th>
-
 <th>Turnover ₹Cr</th>
-
 </tr>
-
 </thead>
 
-<tbody id="rows">
-</tbody>
+<tbody id="rows"></tbody>
 
 </table>
 
@@ -1576,236 +719,141 @@ Pre-open live feed का इंतजार…
 
 <div class="note">
 
-30% IEP Gap •
-25% Buy/Sell Imbalance •
-20% Buy Quantity •
+25% IEP Gap •
+20% Buy/Sell Imbalance •
+15% Buy Quantity •
+15% IEQ Participation •
 10% NIFTY Relative •
 10% Previous Strength •
 5% Liquidity
 
-<br>
+<br><br>
 
-Live data:
-Upstox Market Data Feed V3 Full
+IEP/IEQ उपलब्ध होते ही score और अधिक accurate होगा।
+Buy/Sell order data मिलते ही candidate दिखाई दे सकता है।
 
 </div>
-
 
 <script>
 
 async function scan(){
 
 const status =
-document.getElementById(
-"status"
-);
-
-status.innerText =
-"Live feed से data लिया जा रहा है…";
+document.getElementById("status");
 
 try{
 
 const response =
-await fetch(
-"/api/scan?ts="
-+ Date.now()
-);
+await fetch("/api/scan?ts=" + Date.now());
 
 const data =
 await response.json();
 
-
 if(data.error){
 
 status.innerText =
-"⚠ "
-+ data.error;
+"⚠ " + data.error;
 
 return;
 
 }
 
-
 status.innerText =
-
 data.message
-
-+ " • NIFTY IEP Gap: "
-+ data.nifty_gap
-+ "%"
-
++ " • NIFTY Gap: "
++ data.nifty_gap + "%"
 + " • "
 + data.time
-
 + " • Candidates: "
 + data.count
-
 + " • Feed: "
 + data.stream;
 
-
 const body =
-document.getElementById(
-"rows"
-);
-
+document.getElementById("rows");
 
 body.innerHTML =
-(data.rows || [])
-
-.map(
-x => `
+(data.rows || []).map(x => `
 
 <tr>
 
-<td>
-${x.rank}
-</td>
+<td>${x.rank}</td>
 
-<td>
-<b>${x.symbol}</b>
-</td>
+<td><b>${x.symbol}</b></td>
 
-<td class="score">
-${x.score}
-</td>
+<td class="score">${x.score}</td>
 
-<td>
-₹${x.iep}
-</td>
+<td>₹${x.iep}</td>
 
-<td>
-${x.gap}%
-</td>
+<td>${x.gap}%</td>
 
-<td>
-${x.buy.toLocaleString()}
-</td>
+<td>${x.buy.toLocaleString()}</td>
 
-<td>
-${x.sell.toLocaleString()}
-</td>
+<td>${x.sell.toLocaleString()}</td>
 
-<td>
-${x.imbalance}%
-</td>
+<td>${x.imbalance}%</td>
 
-<td>
-${x.previous}
-</td>
+<td>${x.ieq.toLocaleString()}</td>
 
-<td>
-${x.relative}
-</td>
+<td>${x.previous}</td>
 
-<td>
-₹${x.turnover}
-</td>
+<td>${x.relative}</td>
+
+<td>₹${x.turnover}</td>
 
 </tr>
 
-`
-)
-
-.join("");
+`).join("");
 
 }
 
 catch(error){
 
 status.innerText =
-"⚠ Connection problem. "
-+ "SCAN NOW दबाएँ।";
+"⚠ Connection problem. SCAN NOW दबाएँ।";
 
 }
 
 }
-
 
 scan();
 
-
-setInterval(
-scan,
-5000
-);
+setInterval(scan,5000);
 
 </script>
 
 </body>
-
 </html>
 """
 
 
-# ---------------------------------------------------------
-# HOME
-# ---------------------------------------------------------
-
 @app.route("/")
 def home():
-
     ensure_stream()
+    return render_template_string(HTML)
 
-    return render_template_string(
-        HTML
-    )
-
-
-# ---------------------------------------------------------
-# API
-# ---------------------------------------------------------
 
 @app.route("/api/scan")
 def api_scan():
 
     try:
+        return jsonify(scan())
 
-        result = scan()
-
-        return jsonify(
-            result
-        )
-
-    except Exception as error:
+    except Exception as e:
 
         return jsonify({
-
-            "time":
-                datetime.now(
-                    IST
-                ).strftime(
-                    "%H:%M:%S"
-                ),
-
+            "time": datetime.now(IST).strftime("%H:%M:%S"),
             "count": 0,
-
             "rows": [],
-
             "nifty_gap": 0,
-
-            "stream":
-                STREAM_STATUS,
-
-            "error":
-                str(error)[:300]
+            "stream": STREAM_STATUS,
+            "error": str(e)[:300]
         })
 
-
-# ---------------------------------------------------------
-# LOCAL RUN
-# ---------------------------------------------------------
 
 if __name__ == "__main__":
 
     app.run(
-
         host="0.0.0.0",
-
-        port=int(
-            os.getenv(
-                "PORT",
-                "5000"
-            )
-        )
+        port=int(os.getenv("PORT", "5000"))
     )
